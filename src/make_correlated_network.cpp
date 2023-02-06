@@ -31,18 +31,24 @@ pattern.
 #include <set>
 #include <tuple>
 #include <unistd.h>
+#include "make_network_mesh.hpp"
 
 using namespace std;
 
 typedef tuple<int, int, char> edge_datum;
 typedef tuple<int, int, int> itriple;
 
+//The default and maximum values for the minimum angle constraint which may
+//be optionally specified when the user chooses to create a network-FEM hybrid
+#define DEF_MIN_ANG 30
+#define MAX_MIN_ANG 60
+
 //Dilute a network in a correlated manner, with a correlation coefficient c,
 //such that a bond selected as a candidate for retention is kept with 
 //probability p = (1 - c)^(zmax - nn), where zmax is the maximum number of
 //bonds to which a given bond can be adjacent, and nn is the current number
 //neighbor bonds.
-void correlated_dilution(vector<edge_datum> &edges, vector<Point> &points, double portion, double correlation, int maxz){
+void correlated_dilution(vector<edge_datum> &edges, vector<Point> &points, double portion, double correlation, int maxz, bool mesh){
 
      //Edges to retain upon dilution
      vector<edge_datum> keepers;
@@ -88,26 +94,33 @@ void correlated_dilution(vector<edge_datum> &edges, vector<Point> &points, doubl
              candidates.erase(candidates.begin() + rand_pos);
              valence[get<0>(edat)] += 1;
              valence[get<1>(edat)] += 1;
-	     kept_points.insert(get<0>(edat));
-	     kept_points.insert(get<1>(edat));
+	     if(! mesh){
+                 kept_points.insert(get<0>(edat));
+                 kept_points.insert(get<1>(edat));
+             }
          }
      }
 
      free(r);
 
-     iter = 0;
-     for(int next_index : kept_points){
-         pmap.insert(make_pair(next_index, iter));
-	 new_points.push_back(points[next_index]);
-	 iter ++;
-     }
+    if(! mesh){
+        iter = 0;
+        for(int next_index : kept_points){
+            pmap.insert(make_pair(next_index, iter));
+	    new_points.push_back(points[next_index]);
+	    iter ++;
+        }
 
-     points = new_points;
+        points = new_points;
 
-     edges.clear();
-     for(edge_datum next_edge : keepers){
-         edges.push_back(make_tuple(pmap[get<0>(next_edge)], pmap[get<1>(next_edge)], get<2>(next_edge)));
-     }
+        edges.clear();
+        for(edge_datum next_edge : keepers){
+            edges.push_back(make_tuple(pmap[get<0>(next_edge)], pmap[get<1>(next_edge)], get<2>(next_edge)));
+        }
+    }
+
+    else edges = keepers;
+
 }
 
 //Multiply each component of an ordered list of doubles by a constant factor
@@ -445,11 +458,130 @@ void add_hinges(vector<Point> &points, vector<edge_datum> &edges, double width){
 	edges = new_edges;
 }
 
+//Obtain a Delaunay finite element mesh that includes the points in the network.
+//Reassign the point list and the indices defining edges, as well as creating
+//triangular facets and computing triangle areas.
+void network_to_mesh(vector<Point> &in_pts, double offset, double min_ang, double max_area, vector<itriple> &facets, vector<double> &areas, vector<int> &lookup){
+
+    vector<Point> out_pts;
+    int idx, v1, v2, v3;
+    map<Point, int> pmap;
+    double dx1, dy1, dx2, dy2;
+
+    //Create the new network-FEM hybrid
+    make_network_mesh(in_pts, out_pts, facets, offset, min_ang, max_area);
+
+    //Make a mapping from old to new point indices
+    idx = 0;
+    for(Point p : out_pts){
+        pmap.insert(make_pair(p, idx++));
+    }
+
+    for(idx = 0; idx < in_pts.size(); idx++){
+        lookup.push_back(pmap[in_pts[idx]]);
+    }
+
+    //Replace the point set
+    in_pts.assign(out_pts.begin(), out_pts.end());
+
+    //Compute triangle areas
+    for(itriple next_facet : facets){
+        v1 = get<0>(next_facet);
+	v2 = get<1>(next_facet);
+	v3 = get<2>(next_facet);
+
+	dx1 = in_pts[v2].x - in_pts[v1].x;
+	dy1 = in_pts[v2].y - in_pts[v1].y;
+	dx2 = in_pts[v3].x - in_pts[v1].x;
+	dy2 = in_pts[v3].y - in_pts[v1].y;
+
+	areas.push_back(.5 * abs(dx1*dy2 - dy1*dx2));
+    }
+}
+
+//If a network-mesh hybrid has been created, point indices in edge 
+//specifications should be updated.
+void replace_edges(vector<edge_datum> &in_edges, vector<int> lookup){
+
+    vector<edge_datum> new_edges;
+
+    for(edge_datum edat : in_edges){
+        new_edges.push_back(make_tuple(lookup[get<0>(edat)], lookup[get<1>(edat)], get<2>(edat)));
+    }
+
+    in_edges.assign(new_edges.begin(), new_edges.end());
+}
+
+//Report a periodic network to a file
+void report_plf(FILE *report_file, vector<Point> points, vector<edge_datum> edges, double offset, vector<itriple> triples){
+
+    //First report a header containing the number of points, the number of
+    //edges, and the dimensions in the x and y directions
+    fprintf(report_file, "%ld\t%ld\t%2.12lf", points.size(), edges.size(), offset);
+    
+    if(triples.size() > 0){
+	    fprintf(report_file, "\t%ld", triples.size());
+    }
+    fprintf(report_file, "\n");
+
+    //If the portion of bonds retained is less than 1, only report those points
+    //that are still included in the network. Otherwise, report all points
+    for(Point p : points){
+        fprintf(report_file, "%2.12lf\t%2.12lf\n", p.x, p.y);
+    }
+
+    //Finally report each edge as a pair of points, followed by a pair of
+    //offsets to apply to the second point, in units of the x and y dimensions
+    //of the space in which the lattice is created.
+
+    for(edge_datum next_edge : edges){
+        fprintf(report_file, "%d\t%d\t%hhd\n", get<0>(next_edge), get<1>(next_edge), get<2>(next_edge));
+    }
+
+    if(triples.size() > 0){
+	    for(itriple t : triples){
+		    fprintf(report_file, "%d\t%d\t%d\n", get<0>(t),get<1>(t),get<2>(t));
+	    }
+    }
+}
+
+//Report a network-mesh hybrid to a file
+void report_mesh(FILE *fh, vector<Point> points, vector<edge_datum> edges, vector<itriple> triples, vector<itriple> triangles, vector<double> areas, double offset){
+
+    //Print header explaining the number of each attribute present
+    fprintf(fh, "%ld\t%ld\t%ld", points.size(), edges.size(), triangles.size());
+
+    if(triples.size() > 0){
+        fprintf(fh, "\t%ld", triples.size());
+    }
+
+    fprintf(fh, "\t%12.8lf\n", offset);
+
+    //Report vertices, edges, mesh cells, and mesh cell areas
+    for(Point p : points){
+        fprintf(fh, "%12.8lf %12.8lf\n", p.x, p.y);
+    }
+
+    for(edge_datum next_edge : edges){
+        fprintf(fh, "%d %d %d\n", get<0>(next_edge), get<1>(next_edge), get<2>(next_edge));
+    }
+
+    for(itriple next_cell : triangles){
+        fprintf(fh, "%d %d %d\n", get<0>(next_cell), get<1>(next_cell), get<2>(next_cell));
+    }
+
+    for(double next_area : areas){
+        fprintf(fh, "%12.8lf\n", next_area);
+    }
+}
+
 int main(int argc, char **argv){
 
     int nx, ny, num_read, maxz, rule_index;
     double scale, portion, correlation, cycle_len, far_right, max_x;
     size_t size;
+    bool make_a_mesh = false;
+    double min_ang = DEF_MIN_ANG, max_area = 0;
 
     //Data structures to hold rules for lattice generation
     vector<vector<double>> rules;
@@ -459,6 +591,11 @@ int main(int argc, char **argv){
     vector<edge_datum> edges;
     vector<Point> points;
     vector<itriple> triples;
+
+    //Data structures for optional FEM mesh
+    vector<int> lookup;
+    vector<double> areas;
+    vector<itriple> facets;
 
     //Data values associated with creating a seed for pseudorandom number
     //generation
@@ -478,16 +615,43 @@ int main(int argc, char **argv){
     bool get_triples = false, hinge = false;
 
     //Check to see if a triples should be determined
-    while((c = getopt(argc, argv, "ht")) != -1){
+    while((c = getopt(argc, argv, "a:hmq:t")) != -1){
         switch(c) {
-			case 'h':
-				hinge = true;
-				break;
+            case 'a':
+                if(sscanf(optarg, "%lf", &max_area) == 1){
+		    if(max_area <= 0){
+		        cerr << "The maximum area must be positive.\n";
+			max_area = 0;
+		    }
+		}
+		else cerr << "The option \"-a\" requires a positive number.\n";
+                break;
+            case 'h':
+                hinge = true;
+                break;
+            case 'm':
+		make_a_mesh = true;
+		break;
+            case 'q':
+                if(sscanf(optarg, "%lf", &min_ang) == 1){
+		    if(min_ang <= 0 || min_ang > MAX_MIN_ANG){
+		        cerr << "The minimum angle must be positive and less then or equal to " << MAX_MIN_ANG << ".\n";
+			min_ang = DEF_MIN_ANG;
+		    }
+		}
+		else cerr << "The option \"-q\" requires a number between 0 and " << MAX_MIN_ANG << ".\n";
+		break;
             case 't':
                 get_triples = true;
                 break;
             case '?' :
-                if(isprint(optopt)){
+		if(optopt == 'a'){
+		    cerr << "The option \"-a\" requires a positive number.\n";
+		}
+		else if(optopt == 'q'){
+		    cerr << "The option \"-q\" requires a number between 0 and " << MAX_MIN_ANG << ".\n";
+		}
+		else if(isprint(optopt)){
                     fprintf(stderr, "Unrecognized option: %c\n", optopt);
                 }
                 else{
@@ -571,11 +735,21 @@ int main(int argc, char **argv){
 
         //Use the protocol discussed in the preamble to this code to dilute
         //bonds in a spatially correlated manner
-        correlated_dilution(edges, points, portion, correlation, maxz);
+        correlated_dilution(edges, points, portion, correlation, maxz, make_a_mesh);
     }
 
-	//Add hinges, if desired
-	if(hinge) add_hinges(points, edges, nx*cycle_len);
+    //Add hinges, if desired
+    if(hinge) add_hinges(points, edges, nx*cycle_len);
+
+    if(make_a_mesh){
+	if(max_area == 0) max_area = .5 * scale * scale;
+        network_to_mesh(points, nx*cycle_len, min_ang, max_area, facets, areas, lookup);
+        replace_edges(edges, lookup);
+    }
+
+    if(get_triples){
+        triples = generate_triples(points, edges);
+    }
 
     //Prompt for file to report the network
     do{
@@ -583,61 +757,14 @@ int main(int argc, char **argv){
         getline(cin, response);
     }while(response.compare("") == 0);
 
-    if(get_triples){
-	    triples = generate_triples(points, edges);
-    }
-
-    //Report the lattice to a file
-
     report_file = fopen(response.c_str(), "w");
 
-    //First report a header containing the number of points, the number of
-    //edges, and the dimensions in the x and y directions
-    //if(portion > 1 - FLOAT_TOL){
-    fprintf(report_file, "%ld\t%ld\t%2.12lf", points.size(), edges.size(), nx*cycle_len);
-    
-    if(get_triples){
-	    fprintf(report_file, "\t%ld", triples.size());
+    //Report the created structures to an appropriate file
+    if(! make_a_mesh){
+        report_plf(report_file, points, edges, nx*cycle_len, triples);
     }
-    fprintf(report_file, "\n");
-    //}
-    /*else{
-        fprintf(report_file, "%ld\t%ld\t%2.12lf\n", pmap.size(), edges.size(), nx*cycle_len);
-    }*/
-    //If the portion of bonds retained is less than 1, only report those points
-    //that are still included in the network. Otherwise, report all points
-    //if(portion > 1 - FLOAT_TOL){
-    for(Point p : points){
-        fprintf(report_file, "%2.12lf\t%2.12lf\n", p.x, p.y);
-    }
-    //}
-
-    /*else{
-        for(auto miter = pmap.begin(); miter != pmap.end(); miter ++){
-            fprintf(report_file, "%2.12lf\t%2.12lf\n", points[miter->first].x, points[miter->first].y);
-        }
-    }*/   
-    
-    //Finally report each edge as a pair of points, followed by a pair of
-    //offsets to apply to the second point, in units of the x and y dimensions
-    //of the space in which the lattice is created.
-
-    //if(portion > 1 - FLOAT_TOL){
-    for(edge_datum next_edge : edges){
-        fprintf(report_file, "%d\t%d\t%hhd\n", get<0>(next_edge), get<1>(next_edge), get<2>(next_edge));
-    }
-    //}
-
-    /*else{
-        for(edge_datum next_edge : edges){
-            fprintf(report_file, "%d\t%d\t%hhd\n", pmap[get<0>(next_edge)], pmap[get<1>(next_edge)], get<2>(next_edge));
-	}
-    }*/
-
-    if(get_triples){
-	    for(itriple t : triples){
-		    fprintf(report_file, "%d\t%d\t%d\n", get<0>(t),get<1>(t),get<2>(t));
-	    }
+    else{
+        report_mesh(report_file, points, edges, triples, facets, areas, nx*cycle_len);
     }
 
     fclose(report_file);
