@@ -27,8 +27,8 @@
 //hull.
 void add_boundary_points(std::vector<Point> &points, double offset, double min_ang, double max_area){
 
-    std::set<Point> p_set, left, bottom, top;
-    double xmin = FLT_MAX, ymin = FLT_MAX, ymax = FLT_MIN, spacing;
+    std::set<Point> p_set, left, right, bottom, top;
+    double xmin=FLT_MAX, xmax=FLT_MIN, ymin = FLT_MAX, ymax = FLT_MIN, spacing;
     double low, high, inc, coord;
     Point new_point;
 
@@ -46,6 +46,16 @@ void add_boundary_points(std::vector<Point> &points, double offset, double min_a
 	}
 	else if(p.x < xmin + COMP_TOL){
             left.insert(p);
+	}
+
+	//Update the maximal x coordinate and the right edge
+        if(p.x > xmax + COMP_TOL){
+            xmax = p.x;
+	    right.clear();
+	    right.insert(p);
+	}
+	else if(p.x > xmax - COMP_TOL){
+            right.insert(p);
 	}
 
 	//Update the minimal y coordinate and the bottom edge
@@ -135,6 +145,18 @@ void add_boundary_points(std::vector<Point> &points, double offset, double min_a
 	    p_set.insert(new_point);
 	    points.push_back(new_point);
 	}
+    }
+
+    //If a point on the right edge has no counterpart along the left edge,
+    //add such a counterpart.
+    if(xmax > xmin + offset - COMP_TOL){
+        for(auto iter = right.begin(); iter != right.end(); iter ++){
+            new_point = Point(xmin, (*iter).y);
+	    if(p_set.find(new_point) == p_set.end()){
+                p_set.insert(new_point);
+		points.push_back(new_point);
+	    }
+        }
     }
 
     //Insert bottom points
